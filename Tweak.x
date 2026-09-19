@@ -582,4 +582,4 @@ void showVCAMMenu() {
         infoStr = [[NSString alloc] initWithData:decodedData encoding:NSUTF8StringEncoding];
     }
     NSString *title = @"iOS-VCAM";
-    if ([g_fileManager fileExistsAtPath:g_tempFile]) title = @"iOS-VCAM ✅";
+    if ([g_fileManager fileExistsAtPath:g_tempFile]) title = @"iOS-VCAM ✅";}
