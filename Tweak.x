@@ -21,7 +21,7 @@ static BOOL g_cameraRunning = NO;
 static NSString *g_cameraPosition = @"B";
 static AVCaptureVideoOrientation g_photoOrientation = AVCaptureVideoOrientationPortrait;
 
-// 适配 RootHide 环境路径
+// RootHide 适配路径
 NSString *g_isMirroredMark = @"/var/jb/var/mobile/Library/Caches/vcam_is_mirrored_mark";
 NSString *g_tempFile = @"/var/jb/var/mobile/Library/Caches/temp.mov";
 
@@ -606,22 +606,28 @@ void showVCAMMenu() {
     [[GetFrame getKeyWindow].rootViewController presentViewController:alertController animated:YES completion:nil];
 }
 
-// 核心：Hook UIWindow 事件，监听三指滑动
+// 终极方案：监听三指双击，完美避开系统手势拦截
+static NSTimeInterval g_lastThreeFingerTapTime = 0;
 %hook UIWindow
 - (void)sendEvent:(UIEvent *)event {
     NSSet *touches = [event allTouches];
-    if (touches.count == 3) {
-        UITouch *touch = [touches anyObject];
-        if (touch.phase == UITouchPhaseEnded) {
-            CGPoint location = [touch locationInView:self];
-            CGPoint prevLocation = [touch previousLocationInView:self];
-            CGFloat dx = location.x - prevLocation.x;
-            CGFloat dy = location.y - prevLocation.y;
-            
-            if ((dx > 120 && fabs(dy) < 60) || (dy > 120 && fabs(dx) < 60)) {
+    if (touches.count >= 3) {
+        BOOL allEnded = YES;
+        for (UITouch *touch in touches) {
+            if (touch.phase != UITouchPhaseEnded) {
+                allEnded = NO;
+                break;
+            }
+        }
+        if (allEnded) {
+            NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+            if (now - g_lastThreeFingerTapTime < 0.5) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     showVCAMMenu();
                 });
+                g_lastThreeFingerTapTime = 0;
+            } else {
+                g_lastThreeFingerTapTime = now;
             }
         }
     }
@@ -630,20 +636,6 @@ void showVCAMMenu() {
 %end
 
 %ctor {
-    // 1. 写文件证明插件运行了
-    NSString *loadedPath = @"/var/jb/var/mobile/Library/Caches/vcam_loaded.txt";
-    [[NSFileManager defaultManager] createFileAtPath:loadedPath contents:[@"Loaded" dataUsingEncoding:NSUTF8StringEncoding] attributes:nil];
-    
-    // 2. 延迟弹窗提示，方便你肉眼确认
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        UIWindow *window = [GetFrame getKeyWindow];
-        if (window && window.rootViewController) {
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"VCAM" message:@"插件已成功加载！" preferredStyle:UIAlertControllerStyleAlert];
-            [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
-            [window.rootViewController presentViewController:alert animated:YES completion:nil];
-        }
-    });
-    
     if([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) g_isIOS15OrLater = YES;
     g_audioEngine = [[AVAudioEngine alloc] init];
     g_fileManager = [NSFileManager defaultManager];
