@@ -24,7 +24,7 @@ static BOOL g_cameraRunning = NO;
 static NSString *g_cameraPosition = @"B";
 static AVCaptureVideoOrientation g_photoOrientation = AVCaptureVideoOrientationPortrait;
 
-// 视频读取相关
+// 视频读取
 static AVAssetReader *reader = nil;
 static AVAssetReaderTrackOutput *videoTrackout_32BGRA = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarVideoRange = nil;
@@ -38,30 +38,28 @@ static AVPlayer *g_audioPlayer = nil;
 static BOOL g_audioEnabled = YES;
 
 // 计时器
-static NSTimeInterval g_videoRecordingStartTime = 0;
 static NSTimeInterval g_lastBufferRefreshTime = 0;
 static const NSTimeInterval BUFFER_REFRESH_INTERVAL = 30.0;
 
-// 环境与设置
+// 环境配置
 static BOOL g_isIOS15OrLater = NO;
 static BOOL g_enableNotification = YES;
 static BOOL g_minimizeUIInteraction = NO;
-static BOOL g_ldRestartCompleted = NO;
 
 // 下载相关
 static NSString *g_downloadAddress = @"";
 static BOOL g_downloadRunning = NO;
 
-// RootHide 适配路径
-NSString *g_isMirroredMark = @"/var/jb/var/mobile/Library/Caches/vcam_is_mirrored_mark";
-NSString *g_tempFile = @"/var/jb/var/mobile/Library/Caches/temp.mov";
+// ⚠️ RootHide 核心规范：这里必须写系统标准路径！
+// Theos 的 RootHide 编译系统会自动将其重定向到 /var/jb 沙盒中
+NSString *g_isMirroredMark = @"/var/mobile/Library/Caches/vcam_is_mirrored_mark";
+NSString *g_tempFile = @"/var/mobile/Library/Caches/temp.mov";
 
-// 悬浮窗管理器
+// 悬浮窗管理
 static UIWindow *g_floatWindow = nil;
 static UIButton *g_floatingBtn = nil;
-static UIViewController *g_pickerHostController = nil;
 
-// MARK: - GetFrame 类（视频帧处理核心）
+// MARK: - GetFrame 类 (视频帧替换核心逻辑)
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef) originSampleBuffer :(BOOL)forceReNew;
 + (UIWindow*)getKeyWindow;
@@ -203,6 +201,7 @@ static UIViewController *g_pickerHostController = nil;
     if (!g_enableNotification) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *window = [GetFrame getKeyWindow];
+        if (!window) return;
         UIView *notificationView = [[UIView alloc] initWithFrame:CGRectMake(0, 44, window.bounds.size.width, 40)];
         notificationView.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.7];
         notificationView.layer.cornerRadius = 10;
@@ -226,7 +225,6 @@ static UIViewController *g_pickerHostController = nil;
         [task setLaunchPath:@"/var/jb/usr/bin/powerselector"];
         [task setArguments:@[@"ldrestart"]];
         [task launch];
-        g_ldRestartCompleted = YES;
         [GetFrame showMinimalNotification:@"Đang khởi động lại các dịch vụ để sửa lỗi camera..."];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             NSTask *uiCacheTask = [[NSTask alloc] init];
@@ -242,8 +240,8 @@ static UIViewController *g_pickerHostController = nil;
 }
 @end
 
-// MARK: - VCAM 悬浮窗管理器 (核心 UI 逻辑)
-@interface VCAMFloatingManager : NSObject <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
+// MARK: - VCAM 悬浮窗管理器 (UI 核心逻辑)
+@interface VCAMFloatingManager : NSObject <PHPickerViewControllerDelegate>
 + (instancetype)sharedInstance;
 - (void)setupFloatingWindow;
 - (void)showMenu;
@@ -335,7 +333,7 @@ static UIViewController *g_pickerHostController = nil;
     [[GetFrame getKeyWindow].rootViewController presentViewController:alertController animated:YES completion:nil];
 }
 
-// 使用 PHPickerViewController 替代 UIImagePicker，异步处理，彻底解决卡死
+// 使用 PHPickerViewController 异步处理，彻底解决卡死
 - (void)selectVideo {
     if (@available(iOS 14.0, *)) {
         PHPickerConfiguration *config = [[PHPickerConfiguration alloc] init];
@@ -357,22 +355,17 @@ static UIViewController *g_pickerHostController = nil;
     
     if ([provider hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) {
         [provider loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier completionHandler:^(NSURL *url, NSError *error) {
-            if (error || !url) {
-                NSLog(@"选择视频失败: %@", error);
-                return;
-            }
+            if (error || !url) return;
             
-            // 此时已经在后台线程，可以安全进行文件拷贝，彻底避免主线程卡死
+            // ⚠️ 核心优化：所有文件 I/O 操作全部丢到后台线程，绝不卡死主线程
             dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
                 NSString *tempPath = [url path];
                 if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
                 
                 NSError *copyError = nil;
                 if ([g_fileManager copyItemAtPath:tempPath toPath:g_tempFile error:&copyError]) {
-                    // 通知 GetFrame 刷新视频 buffer
                     [g_fileManager createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] withIntermediateDirectories:YES attributes:nil error:nil];
                     
-                    // 回到主线程，启动音频播放和提示
                     dispatch_async(dispatch_get_main_queue(), ^{
                         [GetFrame setupAudioPlayback];
                         [GetFrame showMinimalNotification:@"视频已加载"];
@@ -380,8 +373,6 @@ static UIViewController *g_pickerHostController = nil;
                             [g_fileManager removeItemAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] error:nil];
                         });
                     });
-                } else {
-                    NSLog(@"视频拷贝失败: %@", copyError);
                 }
             });
         }];
@@ -430,7 +421,7 @@ static UIViewController *g_pickerHostController = nil;
 }
 @end
 
-// MARK: - 越狱 Hook 核心逻辑
+// MARK: - Hook 核心逻辑
 
 CALayer *g_maskLayer = nil;
 
@@ -514,9 +505,8 @@ CALayer *g_maskLayer = nil;
 %hook AVCaptureSession
 -(void) startRunning {
     g_cameraRunning = YES; g_bufferReload = YES;
-    g_videoRecordingStartTime = [[NSDate date] timeIntervalSince1970];
-    g_lastBufferRefreshTime = g_videoRecordingStartTime;
-    g_refreshPreviewByVideoDataOutputTime = g_videoRecordingStartTime * 1000;
+    g_lastBufferRefreshTime = [[NSDate date] timeIntervalSince1970];
+    g_refreshPreviewByVideoDataOutputTime = g_lastBufferRefreshTime * 1000;
     %orig;
 }
 -(void) stopRunning {
@@ -702,19 +692,17 @@ CALayer *g_maskLayer = nil;
 }
 %end
 
-// MARK: - 初始化与销毁
+// MARK: - 初始化和销毁
 %ctor {
     if([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) g_isIOS15OrLater = YES;
     g_audioEngine = [[AVAudioEngine alloc] init];
     g_fileManager = [NSFileManager defaultManager];
     g_pasteboard = [UIPasteboard generalPasteboard];
     
-    // 监听应用启动，确保悬浮窗在合适的时机出现
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
         [[VCAMFloatingManager sharedInstance] setupFloatingWindow];
     }];
     
-    // 兜底创建（防止部分应用不发通知）
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [[VCAMFloatingManager sharedInstance] setupFloatingWindow];
     });
