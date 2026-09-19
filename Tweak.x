@@ -2,8 +2,10 @@
 #import <Foundation/Foundation.h>
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <PhotosUI/PhotosUI.h>
 #import <substrate.h>
 
+// MARK: - 私有类声明
 @interface NSTask : NSObject
 @property (nonatomic, retain) NSString *launchPath;
 @property (nonatomic, retain) NSArray *arguments;
@@ -11,6 +13,7 @@
 - (void)waitUntilExit;
 @end
 
+// MARK: - 全局变量
 static NSFileManager *g_fileManager = nil;
 static UIPasteboard *g_pasteboard = nil;
 static BOOL g_canReleaseBuffer = YES;
@@ -21,46 +24,50 @@ static BOOL g_cameraRunning = NO;
 static NSString *g_cameraPosition = @"B";
 static AVCaptureVideoOrientation g_photoOrientation = AVCaptureVideoOrientationPortrait;
 
-// 越狱层悬浮窗
-static UIWindow *g_floatWindow = nil;
-static UIButton *g_floatingBtn = nil;
-
-// RootHide 适配路径
-NSString *g_isMirroredMark = @"/var/jb/var/mobile/Library/Caches/vcam_is_mirrored_mark";
-NSString *g_tempFile = @"/var/jb/var/mobile/Library/Caches/temp.mov";
-
+// 视频读取相关
 static AVAssetReader *reader = nil;
 static AVAssetReaderTrackOutput *videoTrackout_32BGRA = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarVideoRange = nil;
 static AVAssetReaderTrackOutput *videoTrackout_420YpCbCr8BiPlanarFullRange = nil;
 static AVAssetReaderTrackOutput *audioTrackout_pcm = nil;
 
+// 音频播放
 static AVAudioEngine *g_audioEngine = nil;
 static AVPlayerItem *g_audioPlayerItem = nil;
 static AVPlayer *g_audioPlayer = nil;
 static BOOL g_audioEnabled = YES;
 
+// 计时器
 static NSTimeInterval g_videoRecordingStartTime = 0;
 static NSTimeInterval g_lastBufferRefreshTime = 0;
 static const NSTimeInterval BUFFER_REFRESH_INTERVAL = 30.0;
 
+// 环境与设置
 static BOOL g_isIOS15OrLater = NO;
 static BOOL g_enableNotification = YES;
 static BOOL g_minimizeUIInteraction = NO;
 static BOOL g_ldRestartCompleted = NO;
 
+// 下载相关
 static NSString *g_downloadAddress = @"";
 static BOOL g_downloadRunning = NO;
 
+// RootHide 适配路径
+NSString *g_isMirroredMark = @"/var/jb/var/mobile/Library/Caches/vcam_is_mirrored_mark";
+NSString *g_tempFile = @"/var/jb/var/mobile/Library/Caches/temp.mov";
+
+// 悬浮窗管理器
+static UIWindow *g_floatWindow = nil;
+static UIButton *g_floatingBtn = nil;
+static UIViewController *g_pickerHostController = nil;
+
+// MARK: - GetFrame 类（视频帧处理核心）
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef) originSampleBuffer :(BOOL)forceReNew;
 + (UIWindow*)getKeyWindow;
 + (void)setupAudioPlayback;
 + (void)showMinimalNotification:(NSString *)message;
 + (void)fixCameraWithLDRestart;
-+ (void)createFloatingWindow;
-+ (void)floatBtnClicked;
-+ (void)handlePan:(UIPanGestureRecognizer *)gesture;
 @end
 
 @implementation GetFrame
@@ -233,16 +240,34 @@ static BOOL g_downloadRunning = NO;
         [[GetFrame getKeyWindow].rootViewController presentViewController:alertController animated:YES completion:nil];
     }
 }
+@end
 
-// 越狱层：创建独立 UIWindow
-+ (void)createFloatingWindow {
+// MARK: - VCAM 悬浮窗管理器 (核心 UI 逻辑)
+@interface VCAMFloatingManager : NSObject <PHPickerViewControllerDelegate, UIDocumentPickerDelegate>
++ (instancetype)sharedInstance;
+- (void)setupFloatingWindow;
+- (void)showMenu;
+- (void)selectVideo;
+- (void)downloadVideo;
+- (void)handlePan:(UIPanGestureRecognizer *)gesture;
+@end
+
+@implementation VCAMFloatingManager
++ (instancetype)sharedInstance {
+    static VCAMFloatingManager *instance = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        instance = [[VCAMFloatingManager alloc] init];
+    });
+    return instance;
+}
+
+- (void)setupFloatingWindow {
     if (g_floatWindow) {
         g_floatWindow.hidden = NO;
         return;
     }
-    
     dispatch_async(dispatch_get_main_queue(), ^{
-        // 获取当前活跃的 UIWindowScene
         UIWindowScene *activeScene = nil;
         for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
             if ([scene isKindOfClass:[UIWindowScene class]] && scene.activationState == UISceneActivationStateForegroundActive) {
@@ -257,11 +282,10 @@ static BOOL g_downloadRunning = NO;
             g_floatWindow = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
         }
         
-        g_floatWindow.windowLevel = UIWindowLevelAlert + 1000; // 绝对最高层
+        g_floatWindow.windowLevel = UIWindowLevelAlert + 1000;
         g_floatWindow.backgroundColor = [UIColor clearColor];
         g_floatWindow.hidden = NO;
         
-        // 保证可以接收点击
         UIViewController *rootVC = [[UIViewController alloc] init];
         rootVC.view.backgroundColor = [UIColor clearColor];
         g_floatWindow.rootViewController = rootVC;
@@ -275,35 +299,145 @@ static BOOL g_downloadRunning = NO;
         [g_floatingBtn setTitle:@"VC" forState:UIControlStateNormal];
         [g_floatingBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         g_floatingBtn.titleLabel.font = [UIFont boldSystemFontOfSize:20];
-        [g_floatingBtn addTarget:self action:@selector(floatBtnClicked) forControlEvents:UIControlEventTouchUpInside];
+        [g_floatingBtn addTarget:self action:@selector(showMenu) forControlEvents:UIControlEventTouchUpInside];
         
         UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
         [g_floatingBtn addGestureRecognizer:pan];
-        
         [g_floatWindow addSubview:g_floatingBtn];
     });
 }
 
-+ (void)floatBtnClicked {
-    extern void showVCAMMenu();
-    showVCAMMenu();
-}
-
-+ (void)handlePan:(UIPanGestureRecognizer *)gesture {
+- (void)handlePan:(UIPanGestureRecognizer *)gesture {
     UIView *btn = gesture.view;
     CGPoint translation = [gesture translationInView:btn.superview];
     btn.center = CGPointMake(btn.center.x + translation.x, btn.center.y + translation.y);
     [gesture setTranslation:CGPointZero inView:btn.superview];
 }
+
+- (void)showMenu {
+    NSString *str = g_pasteboard.string;
+    NSString *infoStr = @"使用镜头后将记录信息";
+    if (str != nil && [str hasPrefix:@"CCVCAM"]) {
+        str = [str substringFromIndex:6];
+        NSData *decodedData = [[NSData alloc] initWithBase64EncodedString:str options:0];
+        infoStr = [[NSString alloc] initWithData:decodedData encoding:NSUTF8StringEncoding];
+    }
+    NSString *title = @"iOS-VCAM";
+    if ([g_fileManager fileExistsAtPath:g_tempFile]) title = @"iOS-VCAM ✅";
+    UIAlertController *alertController = [UIAlertController alertControllerWithTitle:title message:infoStr preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertAction *next = [UIAlertAction actionWithTitle:@"选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){ [self selectVideo]; }];
+    UIAlertAction *download = [UIAlertAction actionWithTitle:@"下载视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){ [self downloadVideo]; }];
+    UIAlertAction *cancelReplace = [UIAlertAction actionWithTitle:@"禁用替换" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action){
+        if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
+    }];
+    UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消操作" style:UIAlertActionStyleCancel handler:nil];
+    [alertController addAction:next]; [alertController addAction:download]; [alertController addAction:cancelReplace]; [alertController addAction:cancel];
+    [[GetFrame getKeyWindow].rootViewController presentViewController:alertController animated:YES completion:nil];
+}
+
+// 使用 PHPickerViewController 替代 UIImagePicker，异步处理，彻底解决卡死
+- (void)selectVideo {
+    if (@available(iOS 14.0, *)) {
+        PHPickerConfiguration *config = [[PHPickerConfiguration alloc] init];
+        config.filter = [PHPickerFilter videosFilter];
+        config.selectionLimit = 1;
+        PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:config];
+        picker.delegate = self;
+        [[GetFrame getKeyWindow].rootViewController presentViewController:picker animated:YES completion:nil];
+    }
+}
+
+#pragma mark - PHPickerViewControllerDelegate
+- (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
+    [picker dismissViewControllerAnimated:YES completion:nil];
+    if (results.count == 0) return;
+
+    PHPickerResult *result = results.firstObject;
+    NSItemProvider *provider = result.itemProvider;
+    
+    if ([provider hasItemConformingToTypeIdentifier:UTTypeMovie.identifier]) {
+        [provider loadFileRepresentationForTypeIdentifier:UTTypeMovie.identifier completionHandler:^(NSURL *url, NSError *error) {
+            if (error || !url) {
+                NSLog(@"选择视频失败: %@", error);
+                return;
+            }
+            
+            // 此时已经在后台线程，可以安全进行文件拷贝，彻底避免主线程卡死
+            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+                NSString *tempPath = [url path];
+                if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
+                
+                NSError *copyError = nil;
+                if ([g_fileManager copyItemAtPath:tempPath toPath:g_tempFile error:&copyError]) {
+                    // 通知 GetFrame 刷新视频 buffer
+                    [g_fileManager createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] withIntermediateDirectories:YES attributes:nil error:nil];
+                    
+                    // 回到主线程，启动音频播放和提示
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [GetFrame setupAudioPlayback];
+                        [GetFrame showMinimalNotification:@"视频已加载"];
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                            [g_fileManager removeItemAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] error:nil];
+                        });
+                    });
+                } else {
+                    NSLog(@"视频拷贝失败: %@", copyError);
+                }
+            });
+        }];
+    }
+}
+
+- (void)downloadVideo {
+    if (g_downloadRunning) return;
+    UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"下载视频" message:@"输入远程视频地址（MOV/MP4）" preferredStyle:UIAlertControllerStyleAlert];
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+        if ([g_downloadAddress isEqual:@""]) { textField.placeholder = @"http://..."; } else { textField.text = g_downloadAddress; }
+        textField.keyboardType = UIKeyboardTypeURL;
+    }];
+    UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"下载" style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
+        g_downloadAddress = alert.textFields[0].text;
+        if ([g_downloadAddress isEqual:@""]) return;
+        g_downloadRunning = YES;
+        [GetFrame showMinimalNotification:@"开始下载..."];
+        
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            NSString *tempPath = [NSString stringWithFormat:@"%@.downloading.mov", g_tempFile];
+            NSData *urlData = [NSData dataWithContentsOfURL:[NSURL URLWithString:g_downloadAddress]];
+            if ([urlData writeToFile:tempPath atomically:YES]) {
+                AVAsset *asset = [AVAsset assetWithURL: [NSURL URLWithString:[NSString stringWithFormat:@"file://%@", tempPath]]];
+                if (asset.playable) {
+                    if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
+                    [g_fileManager moveItemAtPath:tempPath toPath:g_tempFile error:nil];
+                    [g_fileManager createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] withIntermediateDirectories:YES attributes:nil error:nil];
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        [GetFrame showMinimalNotification:@"下载完成"];
+                        [g_fileManager removeItemAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] error:nil];
+                    });
+                } else {
+                    if ([g_fileManager fileExistsAtPath:tempPath]) [g_fileManager removeItemAtPath:tempPath error:nil];
+                    dispatch_async(dispatch_get_main_queue(), ^{ [GetFrame showMinimalNotification:@"视频格式无效"]; });
+                }
+            } else {
+                dispatch_async(dispatch_get_main_queue(), ^{ [GetFrame showMinimalNotification:@"下载失败"]; });
+            }
+            g_downloadRunning = NO;
+        });
+    }];
+    UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleDefault handler:nil];
+    [alert addAction:okAction]; [alert addAction:cancel];
+    [[GetFrame getKeyWindow].rootViewController presentViewController:alert animated:YES completion:nil];
+}
 @end
+
+// MARK: - 越狱 Hook 核心逻辑
 
 CALayer *g_maskLayer = nil;
 
 %hook AVCaptureVideoPreviewLayer
 - (void)addSublayer:(CALayer *)layer{
     %orig;
-    // 当相机预览层出现时，保证悬浮窗存在
-    [GetFrame createFloatingWindow];
+    [[VCAMFloatingManager sharedInstance] setupFloatingWindow];
     
     static CADisplayLink *displayLink = nil;
     if (displayLink == nil) {
@@ -568,122 +702,21 @@ CALayer *g_maskLayer = nil;
 }
 %end
 
-@interface CCUIImagePickerDelegate : NSObject <UINavigationControllerDelegate,UIImagePickerControllerDelegate>
-@end
-@implementation CCUIImagePickerDelegate
-- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<NSString *,id> *)info {
-    [[GetFrame getKeyWindow].rootViewController dismissViewControllerAnimated:YES completion:nil];
-    NSString *selectFile = info[@"UIImagePickerControllerMediaURL"];
-    if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
-    if ([g_fileManager copyItemAtPath:selectFile toPath:g_tempFile error:nil]) {
-        [g_fileManager createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] withIntermediateDirectories:YES attributes:nil error:nil];
-        [GetFrame setupAudioPlayback];
-        sleep(1);
-        [g_fileManager removeItemAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] error:nil];
-    }
-}
-- (void)imagePickerControllerDidCancel:(UIImagePickerController *)picker {
-    [[GetFrame getKeyWindow].rootViewController dismissViewControllerAnimated:YES completion:nil];
-}
-@end
-
-void ui_selectVideo(){
-    if (g_minimizeUIInteraction) [GetFrame showMinimalNotification:@"Đang mở thư viện video..."];
-    static CCUIImagePickerDelegate *delegate = nil;
-    if (delegate == nil) delegate = [CCUIImagePickerDelegate new];
-    UIImagePickerController *picker = [[UIImagePickerController alloc] init];
-    picker.sourceType = UIImagePickerControllerSourceTypePhotoLibrary;
-    picker.mediaTypes = [NSArray arrayWithObjects:@"public.movie", nil];
-    picker.videoQuality = UIImagePickerControllerQualityTypeHigh;
-    if (@available(iOS 11.0, *)) picker.videoExportPreset = AVAssetExportPresetPassthrough;
-    picker.allowsEditing = YES;
-    picker.delegate = delegate;
-    UIViewController *rootVC = [GetFrame getKeyWindow].rootViewController;
-    picker.modalPresentationStyle = UIModalPresentationOverFullScreen;
-    picker.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
-    [rootVC presentViewController:picker animated:YES completion:nil];
-}
-
-@interface AVSystemController : NSObject
-+ (id)sharedAVSystemController;
-- (BOOL)getVolume:(float*)arg1 forCategory:(id)arg2;
-- (BOOL)setVolumeTo:(float)arg1 forCategory:(id)arg2;
-@end
-
-void ui_downloadVideo(){
-    if (g_downloadRunning) return;
-    void (^startDownload)(void) = ^{
-        g_downloadRunning = YES;
-        NSString *tempPath = [NSString stringWithFormat:@"%@.downloading.mov", g_tempFile];
-        NSData *urlData = [NSData dataWithContentsOfURL:[NSURL URLWithString:g_downloadAddress]];
-        if ([urlData writeToFile:tempPath atomically:YES]) {
-            AVAsset *asset = [AVAsset assetWithURL: [NSURL URLWithString:[NSString stringWithFormat:@"file://%@", tempPath]]];
-            if (asset.playable) {
-                if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
-                [g_fileManager moveItemAtPath:tempPath toPath:g_tempFile error:nil];
-                [[%c(AVSystemController) sharedAVSystemController] setVolumeTo:0 forCategory:@"Ringtone"];
-                [g_fileManager createDirectoryAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] withIntermediateDirectories:YES attributes:nil error:nil];
-                sleep(1);
-                [g_fileManager removeItemAtPath:[NSString stringWithFormat:@"%@.new", g_tempFile] error:nil];
-            } else {
-                if ([g_fileManager fileExistsAtPath:tempPath]) [g_fileManager removeItemAtPath:tempPath error:nil];
-            }
-        } else {
-            if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
-        }
-        [[%c(AVSystemController) sharedAVSystemController] setVolumeTo:0 forCategory:@"Ringtone"];
-        g_downloadRunning = NO;
-    };
-    dispatch_async(dispatch_queue_create("download", nil), startDownload);
-}
-
-void showVCAMMenu() {
-    NSString *str = g_pasteboard.string;
-    NSString *infoStr = @"使用镜头后将记录信息";
-    if (str != nil && [str hasPrefix:@"CCVCAM"]) {
-        str = [str substringFromIndex:6];
-        NSData *decodedData = [[NSData alloc] initWithBase64EncodedString:str options:0];
-        infoStr = [[NSString alloc] initWithData:decodedData encoding:NSUTF8StringEncoding];
-    }
-    NSString *title = @"iOS-VCAM";
-    if ([g_fileManager fileExistsAtPath:g_tempFile]) title = @"iOS-VCAM ✅";
-    UIAlertController *alertController = [UIAlertController alertControllerWithTitle:title message:infoStr preferredStyle:UIAlertControllerStyleAlert];
-    UIAlertAction *next = [UIAlertAction actionWithTitle:@"选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){ ui_selectVideo(); }];
-    UIAlertAction *download = [UIAlertAction actionWithTitle:@"下载视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){
-        UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"下载视频" message:@"尽量使用MOV格式视频\nMP4也可" preferredStyle:UIAlertControllerStyleAlert];
-        [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-            if ([g_downloadAddress isEqual:@""]) { textField.placeholder = @"远程视频地址"; } else { textField.text = g_downloadAddress; }
-            textField.keyboardType = UIKeyboardTypeURL;
-        }];
-        UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"确认" style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
-            g_downloadAddress = alert.textFields[0].text;
-        }];
-        UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleDefault handler:nil];
-        [alert addAction:okAction]; [alert addAction:cancel];
-        [[GetFrame getKeyWindow].rootViewController presentViewController:alert animated:YES completion:nil];
-    }];
-    UIAlertAction *cancelReplace = [UIAlertAction actionWithTitle:@"禁用替换" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action){
-        if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
-    }];
-    UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消操作" style:UIAlertActionStyleCancel handler:nil];
-    [alertController addAction:next]; [alertController addAction:download]; [alertController addAction:cancelReplace]; [alertController addAction:cancel];
-    [[GetFrame getKeyWindow].rootViewController presentViewController:alertController animated:YES completion:nil];
-}
-
+// MARK: - 初始化与销毁
 %ctor {
     if([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) g_isIOS15OrLater = YES;
     g_audioEngine = [[AVAudioEngine alloc] init];
     g_fileManager = [NSFileManager defaultManager];
     g_pasteboard = [UIPasteboard generalPasteboard];
     
-    // 监听应用启动，一旦启动就立刻创建悬浮窗
+    // 监听应用启动，确保悬浮窗在合适的时机出现
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
-        [GetFrame createFloatingWindow];
+        [[VCAMFloatingManager sharedInstance] setupFloatingWindow];
     }];
     
-    // 兜底：延迟 1 秒后尝试创建（防止某些 App 不发送通知）
+    // 兜底创建（防止部分应用不发通知）
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [GetFrame createFloatingWindow];
+        [[VCAMFloatingManager sharedInstance] setupFloatingWindow];
     });
 }
 
