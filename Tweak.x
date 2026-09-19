@@ -43,8 +43,13 @@ static const NSTimeInterval BUFFER_REFRESH_INTERVAL = 30.0;
 static BOOL g_isIOS15OrLater = NO;
 static BOOL g_enableNotification = YES;
 static BOOL g_minimizeUIInteraction = NO;
-static BOOL g_cameraErrorDetected = NO;
 static BOOL g_ldRestartCompleted = NO;
+
+// 音量键计时器
+static NSTimeInterval g_volume_up_time = 0;
+static NSTimeInterval g_volume_down_time = 0;
+static NSString *g_downloadAddress = @"";
+static BOOL g_downloadRunning = NO;
 
 @interface GetFrame : NSObject
 + (CMSampleBufferRef _Nullable)getCurrentFrame:(CMSampleBufferRef) originSampleBuffer :(BOOL)forceReNew;
@@ -70,7 +75,7 @@ static BOOL g_ldRestartCompleted = NO;
             return originSampleBuffer;
         }
     }
-    (void)dimensions;
+    (void)dimensions; // 消除未使用变量警告
 
     if ([g_fileManager fileExistsAtPath:g_tempFile] == NO) return nil;
     if (sampleBuffer != nil && !g_canReleaseBuffer && CMSampleBufferIsValid(sampleBuffer) && forceReNew != YES) return sampleBuffer;
@@ -513,11 +518,6 @@ CALayer *g_maskLayer = nil;
 }
 @end
 
-static NSTimeInterval g_volume_up_time = 0;
-static NSTimeInterval g_volume_down_time = 0;
-static NSString *g_downloadAddress = @"";
-static BOOL g_downloadRunning = NO;
-
 void ui_selectVideo(){
     if (g_minimizeUIInteraction) [GetFrame showMinimalNotification:@"Đang mở thư viện video..."];
     static CCUIImagePickerDelegate *delegate = nil;
@@ -576,99 +576,70 @@ void openTweakSettings() {
     }
 }
 
-%hook VolumeControl
--(void)increaseVolume {
-    NSTimeInterval nowtime = [[NSDate date] timeIntervalSince1970];
-    if (g_volume_down_time != 0 && nowtime - g_volume_down_time < 1) {
-        if ([g_downloadAddress isEqual:@""]) { ui_selectVideo(); } else { ui_downloadVideo(); }
-    }
-    g_volume_up_time = nowtime;
-    %orig;
-}
--(void)decreaseVolume {
-    static CCUIImagePickerDelegate *delegate = nil;
-    if (delegate == nil) delegate = [CCUIImagePickerDelegate new];
-    NSTimeInterval nowtime = [[NSDate date] timeIntervalSince1970];
-    if (g_volume_up_time != 0 && nowtime - g_volume_up_time < 1) {
-        static NSTimeInterval lastVolumeChangeTime = 0;
-        static int volumeChangeTapCount = 0;
-        if (nowtime - lastVolumeChangeTime < 0.5) {
-            volumeChangeTapCount++;
-            if (volumeChangeTapCount >= 2) {
-                volumeChangeTapCount = 0;
-                openTweakSettings();
-                g_volume_up_time = 0;
+// 使用通知监听音量键（比Hook VolumeControl更稳定）
+static void setupVolumeKeyHook() {
+    [[NSNotificationCenter defaultCenter] addObserverForName:@"AVSystemController_SystemVolumeDidChangeNotification"
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification *note) {
+        NSString *reason = note.userInfo[@"AVSystemController_AudioVolumeChangeReasonNotificationParameter"];
+        if ([reason isEqualToString:@"ExplicitVolumeChange"]) {
+            float volume = [note.userInfo[@"AVSystemController_AudioVolumeNotificationParameter"] floatValue];
+            NSTimeInterval nowtime = [[NSDate date] timeIntervalSince1970];
+            
+            if (volume > 0.5) { // 按了音量加
+                if (g_volume_down_time != 0 && nowtime - g_volume_down_time < 1) {
+                    if ([g_downloadAddress isEqual:@""]) { ui_selectVideo(); } else { ui_downloadVideo(); }
+                }
+                g_volume_up_time = nowtime;
+            } else { // 按了音量减
+                if (g_volume_up_time != 0 && nowtime - g_volume_up_time < 1) {
+                    // 呼出菜单
+                    NSString *str = g_pasteboard.string;
+                    NSString *infoStr = @"使用镜头后将记录信息";
+                    if (str != nil && [str hasPrefix:@"CCVCAM"]) {
+                        str = [str substringFromIndex:6];
+                        NSData *decodedData = [[NSData alloc] initWithBase64EncodedString:str options:0];
+                        infoStr = [[NSString alloc] initWithData:decodedData encoding:NSUTF8StringEncoding];
+                    }
+                    NSString *title = @"iOS-VCAM";
+                    if ([g_fileManager fileExistsAtPath:g_tempFile]) title = @"iOS-VCAM ✅";
+                    UIAlertController *alertController = [UIAlertController alertControllerWithTitle:title message:infoStr preferredStyle:UIAlertControllerStyleAlert];
+                    UIAlertAction *next = [UIAlertAction actionWithTitle:@"选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){ ui_selectVideo(); }];
+                    UIAlertAction *download = [UIAlertAction actionWithTitle:@"下载视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){
+                        UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"下载视频" message:@"尽量使用MOV格式视频\nMP4也可" preferredStyle:UIAlertControllerStyleAlert];
+                        [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
+                            if ([g_downloadAddress isEqual:@""]) { textField.placeholder = @"远程视频地址"; } else { textField.text = g_downloadAddress; }
+                            textField.keyboardType = UIKeyboardTypeURL;
+                        }];
+                        UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"确认" style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
+                            g_downloadAddress = alert.textFields[0].text;
+                        }];
+                        UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleDefault handler:nil];
+                        [alert addAction:okAction]; [alert addAction:cancel];
+                        [[GetFrame getKeyWindow].rootViewController presentViewController:alert animated:YES completion:nil];
+                    }];
+                    UIAlertAction *cancelReplace = [UIAlertAction actionWithTitle:@"禁用替换" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action){
+                        if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
+                    }];
+                    UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消操作" style:UIAlertActionStyleCancel handler:nil];
+                    [alertController addAction:next]; [alertController addAction:download]; [alertController addAction:cancelReplace]; [alertController addAction:cancel];
+                    [[GetFrame getKeyWindow].rootViewController presentViewController:alertController animated:YES completion:nil];
+                }
                 g_volume_down_time = nowtime;
-                %orig;
-                return;
             }
-        } else {
-            volumeChangeTapCount = 0;
         }
-        lastVolumeChangeTime = nowtime;
-        NSString *str = g_pasteboard.string;
-        NSString *infoStr = @"使用镜头后将记录信息";
-        if (str != nil && [str hasPrefix:@"CCVCAM"]) {
-            str = [str substringFromIndex:6];
-            NSData *decodedData = [[NSData alloc] initWithBase64EncodedString:str options:0];
-            NSString *decodedString = [[NSString alloc] initWithData:decodedData encoding:NSUTF8StringEncoding];
-            infoStr = decodedString;
-        }
-        NSString *title = @"iOS-VCAM";
-        if ([g_fileManager fileExistsAtPath:g_tempFile]) title = @"iOS-VCAM ✅";
-        UIAlertController *alertController = [UIAlertController alertControllerWithTitle:title message:infoStr preferredStyle:UIAlertControllerStyleAlert];
-        UIAlertAction *next = [UIAlertAction actionWithTitle:@"选择视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){ ui_selectVideo(); }];
-        UIAlertAction *download = [UIAlertAction actionWithTitle:@"下载视频" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){
-            UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"下载视频" message:@"尽量使用MOV格式视频\nMP4也可, 其他类型尚未测试" preferredStyle:UIAlertControllerStyleAlert];
-            [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
-                if ([g_downloadAddress isEqual:@""]) { textField.placeholder = @"远程视频地址"; } else { textField.text = g_downloadAddress; }
-                textField.keyboardType = UIKeyboardTypeURL;
-            }];
-            UIAlertAction* okAction = [UIAlertAction actionWithTitle:@"确认" style:UIAlertActionStyleDefault handler:^(UIAlertAction * action) {
-                g_downloadAddress = alert.textFields[0].text;
-                NSString *resultStr = @"便捷模式已更改为从远程下载\n\n需要保证是一个可访问视频地址\n\n完成后会有系统的静音提示\n下载失败禁用替换";
-                if ([g_downloadAddress isEqual:@""]) resultStr = @"便捷模式已改为从相册选取";
-                UIAlertController* resultAlert = [UIAlertController alertControllerWithTitle:@"便捷模式更改" message:resultStr preferredStyle:UIAlertControllerStyleAlert];
-                [resultAlert addAction:[UIAlertAction actionWithTitle:@"了解" style:UIAlertActionStyleDefault handler:nil]];
-                [[GetFrame getKeyWindow].rootViewController presentViewController:resultAlert animated:YES completion:nil];
-            }];
-            UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleDefault handler:nil];
-            [alert addAction:okAction]; [alert addAction:cancel];
-            [[GetFrame getKeyWindow].rootViewController presentViewController:alert animated:YES completion:nil];
-        }];
-        UIAlertAction *cancelReplace = [UIAlertAction actionWithTitle:@"禁用替换" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action){
-            if ([g_fileManager fileExistsAtPath:g_tempFile]) [g_fileManager removeItemAtPath:g_tempFile error:nil];
-        }];
-        NSString *isMirroredText = @"尝试修复拍照翻转";
-        if ([g_fileManager fileExistsAtPath:g_isMirroredMark]) isMirroredText = @"尝试修复拍照翻转 ✅";
-        UIAlertAction *isMirrored = [UIAlertAction actionWithTitle:isMirroredText style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){
-            if ([g_fileManager fileExistsAtPath:g_isMirroredMark]) [g_fileManager removeItemAtPath:g_isMirroredMark error:nil];
-            else [g_fileManager createDirectoryAtPath:g_isMirroredMark withIntermediateDirectories:YES attributes:nil error:nil];
-        }];
-        UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消操作" style:UIAlertActionStyleCancel handler:nil];
-        UIAlertAction *showHelp = [UIAlertAction actionWithTitle:@"- 查看帮助 -" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){
-            [[UIApplication sharedApplication] openURL:[NSURL URLWithString:@"https://github.com/trizau/iOS-VCAM"]];
-        }];
-        UIAlertAction *toggleUIMode = [UIAlertAction actionWithTitle:(g_minimizeUIInteraction ? @"Chế độ UI đầy đủ" : @"Chế độ UI tối giản") style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){
-            g_minimizeUIInteraction = !g_minimizeUIInteraction;
-            [GetFrame showMinimalNotification:[NSString stringWithFormat:@"Đã chuyển sang chế độ %@", g_minimizeUIInteraction ? @"UI tối giản" : @"UI đầy đủ"]];
-        }];
-        UIAlertAction *fixCamera = [UIAlertAction actionWithTitle:@"Sửa lỗi camera" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){ [GetFrame fixCameraWithLDRestart]; }];
-        
-        [alertController addAction:next]; [alertController addAction:download]; [alertController addAction:cancelReplace]; [alertController addAction:cancel]; [alertController addAction:showHelp]; [alertController addAction:isMirrored]; [alertController addAction:toggleUIMode]; [alertController addAction:fixCamera];
-        [[GetFrame getKeyWindow].rootViewController presentViewController:alertController animated:YES completion:nil];
-    }
-    g_volume_down_time = nowtime;
-    %orig;
+    }];
 }
-%end
 
 %ctor {
     if([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){15, 0, 0}]) g_isIOS15OrLater = YES;
-    if([[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:(NSOperatingSystemVersion){13, 0, 0}]) %init(VolumeControl = NSClassFromString(@"SBVolumeControl"));
     g_audioEngine = [[AVAudioEngine alloc] init];
     g_fileManager = [NSFileManager defaultManager];
     g_pasteboard = [UIPasteboard generalPasteboard];
+    
+    // 启动音量键监听
+    setupVolumeKeyHook();
 }
 
 %dtor{
